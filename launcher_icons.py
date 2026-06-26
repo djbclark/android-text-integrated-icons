@@ -20,7 +20,22 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
+
+GRADLE_VERSION = "8.5"
+GRADLE_WRAPPER_PROPERTIES = f"""distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\\://services.gradle.org/distributions/gradle-{GRADLE_VERSION}-bin.zip
+networkTimeout=10000
+validateDistributionUrl=true
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+"""
+GRADLE_WRAPPER_JAR_URL = (
+    f"https://raw.githubusercontent.com/gradle/gradle/v{GRADLE_VERSION}.0/"
+    "gradle/wrapper/gradle-wrapper.jar"
+)
+GRADLEW_URL = f"https://raw.githubusercontent.com/gradle/gradle/v{GRADLE_VERSION}.0/gradlew"
 
 
 def _apk_enabled_by_default() -> bool:
@@ -152,6 +167,22 @@ def ensure_pillow() -> None:
         sys.exit(1)
 
 
+def _make_executable(path: Path) -> None:
+    """Ensure a file can be executed (zip extracts often drop the +x bit)."""
+    try:
+        mode = path.stat().st_mode
+        path.chmod(mode | 0o111)
+    except OSError:
+        pass
+
+
+def _java_available() -> bool:
+    if shutil.which("java"):
+        return True
+    java_home = os.environ.get("JAVA_HOME")
+    return bool(java_home and (Path(java_home) / "bin" / "java").exists())
+
+
 def _set_java_home() -> None:
     for candidate in [
         "/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk",
@@ -198,32 +229,31 @@ def _install_java_gradle_via_pkg_or_apt() -> bool:
     return False
 
 
-def ensure_build_tools() -> None:
-    """Ensure Java + Gradle are available. Installs via pkg/apt by default when missing."""
-    has_java = bool(shutil.which("java") or shutil.which("javac"))
-    has_gradle = bool(shutil.which("gradle"))
+def ensure_build_tools() -> bool:
+    """Ensure Java is available for APK builds. Installs via pkg/apt by default when missing."""
+    if _java_available():
+        return True
 
-    if has_java and has_gradle:
-        return
-
-    print("\nGradle + Java are required for APK builds (enabled by default).")
+    print("\nJava is required for APK builds (enabled by default).")
 
     try:
         if _install_java_gradle_via_pkg_or_apt():
             _set_java_home()
-            print("✅ Java + Gradle installed via package manager.")
-            if is_termux() or AUTO_INSTALL:
-                print("Setting up Android SDK...")
-                setup_minimal_android_sdk()
-            return
+            if _java_available():
+                print("✅ Java installed via package manager.")
+                if is_termux() or AUTO_INSTALL:
+                    print("Setting up Android SDK...")
+                    setup_minimal_android_sdk()
+                return True
+            print("Package manager reported success but java is still missing from PATH.")
     except subprocess.CalledProcessError as e:
         print(f"Package manager install failed: {e}")
 
     # Fallback for distros without pkg/apt
     if not sys.stdin.isatty() and not AUTO_INSTALL:
-        print("Non-interactive session: could not install Java/Gradle automatically.")
-        print("Install Java (JDK 17+) and Gradle manually, or re-run with -y.")
-        return
+        print("Non-interactive session: could not install Java automatically.")
+        print("Install Java (JDK 17+) manually, or re-run with -y.")
+        return False
 
     print("Trying other package managers...")
     success = False
@@ -250,11 +280,15 @@ def ensure_build_tools() -> None:
 
     if success:
         _set_java_home()
-        print("✅ Java + Gradle installation attempted.")
-        if AUTO_INSTALL:
-            setup_minimal_android_sdk()
-    else:
-        print("Could not auto-install. Please install Java (JDK 17+) and Gradle manually.")
+        if _java_available():
+            print("✅ Java installation attempted and verified.")
+            if AUTO_INSTALL:
+                setup_minimal_android_sdk()
+            return True
+        print("Install commands ran but java is still missing from PATH.")
+
+    print("Could not auto-install Java. Please install JDK 17+ manually.")
+    return False
 
 
 def download_gradle_manually() -> bool:
@@ -277,12 +311,14 @@ def download_gradle_manually() -> bool:
         # The extracted folder is gradle-8.5
         gradle_bin = target_dir.parent / f"gradle-{gradle_version}" / "bin" / "gradle"
         if gradle_bin.exists():
+            _make_executable(gradle_bin)
             # Symlink or add to PATH suggestion
             (Path.home() / ".local" / "bin").mkdir(parents=True, exist_ok=True)
             link = Path.home() / ".local" / "bin" / "gradle"
             if link.exists():
                 link.unlink()
             link.symlink_to(gradle_bin)
+            _make_executable(link)
             os.environ["PATH"] = str(link.parent) + os.pathsep + os.environ.get("PATH", "")
             print(f"Gradle installed to {gradle_bin}")
             return True
@@ -512,12 +548,116 @@ def process_icon(
         return False
 
 
+def _download_file(url: str, dest: Path) -> None:
+    import urllib.request
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if shutil.which("wget"):
+        subprocess.run(["wget", "-q", "-O", str(dest), url], check=True)
+    elif shutil.which("curl"):
+        subprocess.run(["curl", "-fsSL", "-o", str(dest), url], check=True)
+    else:
+        urllib.request.urlretrieve(url, dest)
+
+
+def bootstrap_gradle_wrapper(project_dir: Path) -> bool:
+    """Create gradlew + wrapper files without requiring system gradle."""
+    import urllib.error
+
+    wrapper_dir = project_dir / "gradle" / "wrapper"
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+
+    props = wrapper_dir / "gradle-wrapper.properties"
+    if not props.exists():
+        props.write_text(GRADLE_WRAPPER_PROPERTIES)
+
+    jar_path = wrapper_dir / "gradle-wrapper.jar"
+    if not jar_path.exists():
+        print(f"  Downloading gradle-wrapper.jar ({GRADLE_VERSION})...")
+        try:
+            _download_file(GRADLE_WRAPPER_JAR_URL, jar_path)
+        except (urllib.error.URLError, subprocess.CalledProcessError, OSError) as e:
+            print(f"  Could not download gradle-wrapper.jar: {e}")
+            return False
+
+    gradlew = project_dir / "gradlew"
+    if not gradlew.exists():
+        print("  Downloading gradlew launcher script...")
+        try:
+            _download_file(GRADLEW_URL, gradlew)
+        except (urllib.error.URLError, subprocess.CalledProcessError, OSError) as e:
+            print(f"  Could not download gradlew: {e}")
+            return False
+
+    _make_executable(gradlew)
+    return gradlew.exists() and jar_path.exists()
+
+
+def ensure_gradle_wrapper(project_dir: Path, env: dict[str, str]) -> bool:
+    """Ensure ./gradlew exists and is executable."""
+    gradlew = project_dir / "gradlew"
+    if gradlew.exists():
+        _make_executable(gradlew)
+        return True
+
+    search_path = env.get("PATH", os.environ.get("PATH", ""))
+    gradle_cmd = shutil.which("gradle", path=search_path)
+    if gradle_cmd:
+        gradle_path = Path(gradle_cmd)
+        _make_executable(gradle_path)
+        if _java_available():
+            print("  Generating Gradle wrapper using system gradle...")
+            subprocess.run(
+                [str(gradle_path), "wrapper", f"--gradle-version={GRADLE_VERSION}"],
+                cwd=project_dir,
+                env=env,
+                check=False,
+            )
+            if gradlew.exists():
+                _make_executable(gradlew)
+                return True
+
+    if not shutil.which("gradle", path=search_path):
+        print("  No gradle in PATH — bootstrapping wrapper directly...")
+    else:
+        print("  System gradle could not create wrapper — bootstrapping directly...")
+
+    if bootstrap_gradle_wrapper(project_dir):
+        return True
+
+    if download_gradle_manually():
+        gradle_cmd = shutil.which("gradle", path=os.environ.get("PATH", ""))
+        if gradle_cmd and _java_available():
+            subprocess.run(
+                [gradle_cmd, "wrapper", f"--gradle-version={GRADLE_VERSION}"],
+                cwd=project_dir,
+                env=env,
+                check=False,
+            )
+            if gradlew.exists():
+                _make_executable(gradlew)
+                return True
+        return bootstrap_gradle_wrapper(project_dir)
+
+    return bootstrap_gradle_wrapper(project_dir)
+
+
 def build_apk(project_dir: Path, pack_name: str) -> None:
     """Aggressively attempt to build a release APK using whatever tools we just installed."""
     print("\n🔨 Aggressively attempting CLI APK build...")
 
+    if not _java_available():
+        print("  Java is not installed or not on PATH.")
+        print("  Re-run with -y to auto-install Java, or install default-jdk / openjdk-17 manually.")
+        print("  The icon pack project was still generated — run ./build.sh after installing Java.")
+        return
+
     # Make sure critical env vars from our setup are in the subprocess env
     env = os.environ.copy()
+    _set_java_home()
+    if env.get("JAVA_HOME"):
+        env["PATH"] = str(Path(env["JAVA_HOME"]) / "bin") + os.pathsep + env.get("PATH", "")
+
     sdk_root = env.get("ANDROID_HOME") or env.get("ANDROID_SDK_ROOT") or str(Path.home() / "Android" / "Sdk")
     if not env.get("ANDROID_HOME"):
         env["ANDROID_HOME"] = sdk_root
@@ -534,65 +674,48 @@ def build_apk(project_dir: Path, pack_name: str) -> None:
             env["PATH"] = p + os.pathsep + env.get("PATH", "")
 
     try:
+        if not ensure_gradle_wrapper(project_dir, env):
+            print("\nCould not create gradlew.")
+            print("Try manually inside the pack folder:")
+            print(f"  cd {project_dir.name}")
+            print("  ./build.sh")
+            return
+
         gradlew = project_dir / "gradlew"
+        _make_executable(gradlew)
+        print("  Running ./gradlew assembleRelease (this may take several minutes on first run)...")
+        result = subprocess.run(
+            [str(gradlew), "assembleRelease", "--console=plain"],
+            cwd=project_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
 
-        # Aggressively ensure wrapper exists
-        if not gradlew.exists():
-            gradle_cmd = shutil.which("gradle")
-            if gradle_cmd:
-                print("  Generating Gradle wrapper using gradle...")
-                subprocess.run(
-                    [gradle_cmd, "wrapper", "--gradle-version", "8.5"],
-                    cwd=project_dir, env=env, check=False
-                )
-            else:
-                # Try downloading wrapper jar directly or use system gradle if present elsewhere
-                print("  No gradle in PATH, trying to prepare wrapper anyway...")
-                # The project has gradle wrapper files usually generated by create, but we force
-                subprocess.run(
-                    ["gradle", "wrapper", "--gradle-version", "8.5"],
-                    cwd=project_dir, env=env, check=False
-                )
+        apk_dir = project_dir / "app" / "build" / "outputs" / "apk" / "release"
+        apk_files = list(apk_dir.glob("*.apk")) if apk_dir.exists() else []
+        if apk_files:
+            apk_src = apk_files[0]
+            apk_dest = project_dir.parent / f"{pack_name}-release.apk"
+            shutil.copy2(apk_src, apk_dest)
+            print(f"\n🎉 SUCCESS! APK built and copied:")
+            print(f"   {apk_dest}")
+            print(f"   Size: {apk_dest.stat().st_size / 1024 / 1024:.1f} MB")
+            return
 
-        if gradlew.exists():
-            gradlew.chmod(0o755)
-            print("  Running ./gradlew assembleRelease (this may take several minutes on first run)...")
-            # Run with some output so user sees progress; -q can hide too much
-            result = subprocess.run(
-                [str(gradlew), "assembleRelease", "--console=plain"],
-                cwd=project_dir,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=600  # longer timeout for SDK downloads on first build
-            )
-
-            apk_dir = project_dir / "app" / "build" / "outputs" / "apk" / "release"
-            apk_files = list(apk_dir.glob("*.apk")) if apk_dir.exists() else []
-            if apk_files:
-                apk_src = apk_files[0]
-                apk_dest = project_dir.parent / f"{pack_name}-release.apk"
-                shutil.copy2(apk_src, apk_dest)
-                print(f"\n🎉 SUCCESS! APK built and copied:")
-                print(f"   {apk_dest}")
-                print(f"   Size: {apk_dest.stat().st_size / 1024 / 1024:.1f} MB")
-                return
-            else:
-                print("Build finished but no APK found in expected location.")
-                print(f"Check: {apk_dir}")
-                if result.returncode != 0:
-                    print("\n--- Gradle output (last part) ---")
-                    out = (result.stdout or "") + "\n" + (result.stderr or "")
-                    print(out[-2000:])
-                return
-
-        print("\nCould not create/ find gradlew.")
-        print("Try manually inside the pack folder:")
-        print(f"  cd {project_dir.name}")
-        print("  ./build.sh   # or gradle wrapper && ./gradlew assembleRelease")
+        print("Build finished but no APK found in expected location.")
+        print(f"Check: {apk_dir}")
+        if result.returncode != 0:
+            print("\n--- Gradle output (last part) ---")
+            out = (result.stdout or "") + "\n" + (result.stderr or "")
+            print(out[-2000:])
 
     except subprocess.TimeoutExpired:
-        print("Build timed out (5 minutes). Try building manually.")
+        print("Build timed out (10 minutes). Try building manually.")
+    except OSError as e:
+        print(f"Build attempt encountered an issue: {e}")
+        print("The project is still fully generated and can be built in Android Studio or with proper Gradle + SDK setup.")
     except Exception as e:
         print(f"Build attempt encountered an issue: {e}")
         print("The project is still fully generated and can be built in Android Studio or with proper Gradle + SDK setup.")
@@ -783,10 +906,21 @@ if [ -z "$ANDROID_HOME" ] && [ -z "$ANDROID_SDK_ROOT" ]; then
 fi
 
 if [ ! -f gradlew ]; then
-    if command -v gradle >/dev/null 2>&1; then
-        echo "Generating gradle wrapper..."
-        gradle wrapper --gradle-version 8.5 || true
-    fi
+    echo "Bootstrapping gradle wrapper (no system gradle required)..."
+    mkdir -p gradle/wrapper
+    curl -fsSL -o gradle/wrapper/gradle-wrapper.jar \\
+        "https://raw.githubusercontent.com/gradle/gradle/v8.5.0/gradle/wrapper/gradle-wrapper.jar" || true
+    curl -fsSL -o gradlew \\
+        "https://raw.githubusercontent.com/gradle/gradle/v8.5.0/gradlew" || true
+    cat > gradle/wrapper/gradle-wrapper.properties <<'EOF'
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\\://services.gradle.org/distributions/gradle-8.5-bin.zip
+networkTimeout=10000
+validateDistributionUrl=true
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+EOF
 fi
 
 if [ -f gradlew ]; then
@@ -883,8 +1017,11 @@ Enjoy your custom icons!
 """
     (project_dir / "README.md").write_text(readme)
 
+    # Pre-bootstrap the Gradle wrapper so fresh systems don't need system gradle installed.
+    bootstrap_gradle_wrapper(project_dir)
+
     print(f"\n✅ Full Gradle icon pack project created at: {project_dir}")
-    print("   • Contains complete build files + build.sh")
+    print("   • Contains complete build files + build.sh + gradlew")
     print("   • Edit appfilter.xml with real component names")
 
     if build_apk_flag:
