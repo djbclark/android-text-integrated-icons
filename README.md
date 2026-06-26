@@ -38,8 +38,8 @@ See [requirements.txt](requirements.txt).
 
 ```bash
 # 1. Get the code
-git clone https://github.com/YOURNAME/launcher_icons.git
-cd launcher_icons
+git clone https://github.com/djbclark/android-text-integrated-icons.git
+cd android-text-integrated-icons
 
 # 2. Make executable
 chmod +x launcher_icons.py
@@ -147,7 +147,7 @@ If the build tools are not present, the script will still generate the complete 
 ## File Structure of This Repo
 
 ```
-launcher_icons/
+android-text-integrated-icons/
 ├── launcher_icons.py
 ├── README.md
 ├── LICENSE
