@@ -4,17 +4,18 @@
 
 Creates beautiful Pixel Launcher-style icons (icon + label below) from plain PNGs. Can generate a complete, Gradle-based Android icon pack project and build a real `.apk` from the command line — no Android Studio or GUI required.
 
-**Version:** 1.3.0
+**Version:** 1.4.0
 
 ## Features
 
 - Pixel Launcher style: icon + white label with shadow below
 - Auto darkens icons for better readability
 - Auto-prompts for Pillow install (fully automatic inside Termux)
-- `--build-apk -y` : the default one-shot mode. Aggressively auto-installs **everything** (Pillow + Java + Gradle + full Android SDK) with no prompts.
-- `-y` / `--yes` / `--auto` flag forces full non-interactive auto-install for any command.
+- **Icon pack + APK build are on by default** — just point the script at your icons folder
+- Java + Gradle auto-installed via **pkg** (Termux) or **apt** (Debian/Ubuntu) when missing
+- `-y` / `--yes` / `--auto` also auto-installs the full Android SDK with no prompts
+- `--no-icon-pack` / `--no-apk` to skip those steps
 - Generates **full Gradle Android project** (not just resources)
-- `--build-apk` flag: builds a real release APK using Gradle from CLI
 - Includes a `build.sh` helper script inside generated packs
 - Dry-run support
 - Works on Termux, Linux, macOS, Windows (Python + Pillow)
@@ -26,9 +27,9 @@ Creates beautiful Pixel Launcher-style icons (icon + label below) from plain PNG
 
 The script will offer to install Pillow for you.
 
-When you use `--build-apk`, the script is **aggressive** about making it "just work":
-- On Termux: fully automatic install of Pillow + openjdk-17 + gradle + unzip + wget + Android cmdline-tools + platform + build-tools (no questions, big downloads happen).
-- On desktop: prompts with defaults leaning toward yes for the SDK.
+APK builds are on by default. The script auto-installs Java + Gradle via **pkg** (Termux) or **apt** (Debian/Ubuntu) when missing.
+- On Termux: also sets up the Android SDK automatically after installing build tools.
+- Add `-y` on other platforms for zero-prompt Android SDK setup (large download).
 
 The generated pack also gets an aggressive `build.sh`.
 
@@ -53,36 +54,39 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## Basic Usage
 
-### Just style the icons
+### Default (recommended — icon pack + APK)
 
 ```bash
-./launcher_icons.py /path/to/raw/icons
+./launcher_icons.py /path/to/icons \
+    --icon-pack-name "MyOneUI" \
+    --package-name "com.yourname.myoneui"
+```
+
+This styles icons, creates the Gradle project, and builds the APK. Java/Gradle install via pkg/apt automatically if missing.
+
+Add `-y` for zero-prompt Android SDK setup:
+
+```bash
+./launcher_icons.py /path/to/icons -y \
+    --icon-pack-name "MyOneUI" \
+    --package-name "com.yourname.myoneui"
+```
+
+### Just style the icons (no pack, no APK)
+
+```bash
+./launcher_icons.py /path/to/raw/icons --no-icon-pack
 ```
 
 Creates `processed_icons/` next to your sources.
 
-### Create styled icons + full icon pack project
+### Icon pack only (skip APK build)
 
 ```bash
-./launcher_icons.py /path/to/icons \
-    --create-icon-pack \
+./launcher_icons.py /path/to/icons --no-apk \
     --icon-pack-name "MyOneUI" \
     --package-name "com.yourname.myoneui"
 ```
-
-### One-shot (recommended — default "just works" behavior)
-
-```bash
-./launcher_icons.py /path/to/icons \
-    --create-icon-pack \
-    --build-apk \
-    -y \
-    --icon-pack-name "MyOneUI" \
-    --package-name "com.yourname.myoneui"
-```
-
-- `-y` / `--yes` / `--auto` = full one-shot, zero prompts. Installs **everything** automatically.
-- `--build-apk -y` is now the recommended default for making a real APK from the command line.
 
 Inside the generated folder you will also find `build.sh` you can run directly:
 
@@ -125,7 +129,7 @@ After generation:
 
 ## CLI APK Building Requirements
 
-To use `--build-apk` or `./build.sh` you need:
+To build APKs (on by default) or run `./build.sh` you need:
 
 - Java + Gradle
 - Android SDK (compileSdk, build tools)

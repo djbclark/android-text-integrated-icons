@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Launcher-style PNG Icon Processor + Icon Pack + CLI APK Builder
-Version 1.3.0
+Version 1.4.0
 
 Features:
 - Creates launcher-style images (icon + label below) mimicking Pixel Launcher
-- -y / --yes / --auto : full one-shot auto-install of Pillow + Java + Gradle + Android SDK (no prompts)
-- --build-apk : generates full Gradle project + tries to build a real APK (one-shot recommended)
-- Aggressive auto-setup is now the default when -y or --build-apk is used
+- Icon pack + APK build are ON by default (use --no-icon-pack / --no-apk to skip)
+- Java + Gradle auto-installed via pkg (Termux) or apt (Debian/Ubuntu) when missing
+- -y / --yes / --auto : also auto-install full Android SDK with zero prompts
 - Includes build.sh helper inside generated packs
 """
 
@@ -20,7 +20,18 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
+
+
+def _apk_enabled_by_default() -> bool:
+    """True unless the user explicitly opts out of icon pack / APK steps."""
+    argv = sys.argv[1:]
+    if any(flag in argv for flag in ("--dry-run", "--no-icon-pack", "--no-apk", "--version", "--help", "-h")):
+        return False
+    # No directory argument → likely --version / --help only
+    if not any(a for a in argv if not a.startswith("-")):
+        return False
+    return True
 
 
 # ==================== AUTO-INSTALL PILLOW ====================
@@ -141,109 +152,83 @@ def ensure_pillow() -> None:
         sys.exit(1)
 
 
-def ensure_build_tools() -> None:
-    """Ensure Java + Gradle (and optionally Android SDK) are available for --build-apk.
+def _set_java_home() -> None:
+    for candidate in [
+        "/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk",
+        "/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk-arm64",
+        "/data/data/com.termux/files/usr/lib/jvm/java-17",
+        "/usr/lib/jvm/default-java",
+        "/usr/lib/jvm/java-17-openjdk",
+    ]:
+        if os.path.exists(candidate):
+            os.environ["JAVA_HOME"] = candidate
+            os.environ["PATH"] = candidate + "/bin:" + os.environ.get("PATH", "")
+            break
 
-    Modeled after the Pillow auto/prompt install logic.
-    Only called when --build-apk is used.
-    """
-    # Quick presence check
+
+def _apt_cmd(*args: str) -> list[str]:
+    """Build an apt-get command, using sudo only when not root."""
+    base = ["apt-get", *args]
+    if os.geteuid() != 0:
+        return ["sudo", *base]
+    return base
+
+
+def _install_java_gradle_via_pkg_or_apt() -> bool:
+    """Install Java + Gradle using pkg (Termux) or apt (Debian/Ubuntu). Returns True on success."""
+    # pkg refuses to run as root; prefer apt when both are available.
+    if is_termux() and os.geteuid() != 0:
+        print("Termux detected — installing openjdk-17 + gradle via pkg...")
+        subprocess.run(["pkg", "update", "-y"], check=False)
+        subprocess.run(
+            ["pkg", "install", "-y", "openjdk-17", "gradle", "unzip", "wget", "coreutils"],
+            check=True,
+        )
+        return True
+
+    if shutil.which("apt-get") or shutil.which("apt"):
+        print("Installing default-jdk + gradle via apt...")
+        subprocess.run(_apt_cmd("update", "-y"), check=False)
+        subprocess.run(
+            _apt_cmd("install", "-y", "default-jdk", "gradle", "unzip", "wget"),
+            check=True,
+        )
+        return True
+
+    return False
+
+
+def ensure_build_tools() -> None:
+    """Ensure Java + Gradle are available. Installs via pkg/apt by default when missing."""
     has_java = bool(shutil.which("java") or shutil.which("javac"))
     has_gradle = bool(shutil.which("gradle"))
 
     if has_java and has_gradle:
         return
 
-    print("\nGradle + Java are required to build APKs (--build-apk).")
+    print("\nGradle + Java are required for APK builds (enabled by default).")
 
-    if is_termux() or AUTO_INSTALL:
-        if is_termux():
-            print("Termux detected — aggressively installing everything needed for APK builds (one-shot mode)...")
-        else:
-            print("AUTO_INSTALL / -y mode — aggressively installing everything (Java + Gradle + Android SDK)...")
-        print("(openjdk-17, gradle, unzip, wget, and full Android SDK tools — this may take several minutes)")
-
-        try:
-            if is_termux():
-                subprocess.run(["pkg", "update", "-y"], check=False)
-                subprocess.run(
-                    ["pkg", "install", "-y",
-                     "openjdk-17", "gradle", "unzip", "wget", "coreutils"],
-                    check=True
-                )
-            else:
-                # Desktop aggressive path (best effort)
-                if shutil.which("apt") or shutil.which("apt-get"):
-                    subprocess.run(["sudo", "apt-get", "update", "-y"], check=False)
-                    subprocess.run(
-                        ["sudo", "apt-get", "install", "-y", "default-jdk", "gradle", "unzip", "wget"],
-                        check=True
-                    )
-                # etc. fall through to manual download if needed
-
-            print("✅ Base tools (Java + Gradle) installed.")
-
-            # Set JAVA_HOME aggressively
-            for candidate in [
-                "/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk",
-                "/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk-arm64",
-                "/data/data/com.termux/files/usr/lib/jvm/java-17",
-                "/usr/lib/jvm/default-java",
-                "/usr/lib/jvm/java-17-openjdk",
-            ]:
-                if os.path.exists(candidate):
-                    os.environ["JAVA_HOME"] = candidate
-                    os.environ["PATH"] = candidate + "/bin:" + os.environ.get("PATH", "")
-                    break
-
-            # Always auto-setup full Android SDK in one-shot / Termux / -y mode
-            print("\nNow aggressively setting up Android SDK (big download, please be patient)...")
-            setup_minimal_android_sdk()
-
-            print("\n✅ All build dependencies should now be ready!")
-            print("Environment variables set for this session. Re-run if shell needs restart.")
+    try:
+        if _install_java_gradle_via_pkg_or_apt():
+            _set_java_home()
+            print("✅ Java + Gradle installed via package manager.")
+            if is_termux() or AUTO_INSTALL:
+                print("Setting up Android SDK...")
+                setup_minimal_android_sdk()
             return
-        except subprocess.CalledProcessError as e:
-            print(f"\nAutomatic installation encountered an error: {e}")
-            print("Trying SDK setup anyway...")
-            setup_minimal_android_sdk()
-            return
+    except subprocess.CalledProcessError as e:
+        print(f"Package manager install failed: {e}")
 
-    # Non-Termux: respect AUTO_INSTALL (from -y or --build-apk)
-    if not sys.stdin.isatty():
-        if AUTO_INSTALL:
-            print("Non-interactive + AUTO_INSTALL: proceeding with auto install.")
-        else:
-            print("Non-interactive session: skipping automatic Gradle/Java install.")
-            print("Install Java (JDK 17+) and Gradle, then re-run with --build-apk.")
-            return
-
-    if AUTO_INSTALL:
-        print("AUTO_INSTALL mode: installing Java + Gradle + SDK automatically (no prompt).")
-        response = "y"
-    else:
-        try:
-            response = input("Install Java + Gradle now? [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\nAborted build tools install.")
-            return
-
-    if response not in ("", "y", "yes"):
-        print("\nSkipping. You can install Java + Gradle manually and re-run.")
+    # Fallback for distros without pkg/apt
+    if not sys.stdin.isatty() and not AUTO_INSTALL:
+        print("Non-interactive session: could not install Java/Gradle automatically.")
+        print("Install Java (JDK 17+) and Gradle manually, or re-run with -y.")
         return
 
-    print("Installing Java + Gradle...\n")
-
+    print("Trying other package managers...")
     success = False
     try:
-        if shutil.which("apt") or shutil.which("apt-get"):
-            subprocess.run(["sudo", "apt-get", "update", "-y"], check=False)
-            subprocess.run(
-                ["sudo", "apt-get", "install", "-y", "default-jdk", "gradle", "unzip", "wget"],
-                check=True
-            )
-            success = True
-        elif shutil.which("dnf"):
+        if shutil.which("dnf"):
             subprocess.run(["sudo", "dnf", "install", "-y", "java-17-openjdk", "gradle"], check=True)
             success = True
         elif shutil.which("yum"):
@@ -257,7 +242,6 @@ def ensure_build_tools() -> None:
             os.environ["JAVA_HOME"] = "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
             success = True
         else:
-            print("No common package manager detected. Trying to download Gradle directly...")
             success = download_gradle_manually()
     except subprocess.CalledProcessError as e:
         print(f"Install command failed: {e}")
@@ -265,22 +249,12 @@ def ensure_build_tools() -> None:
         print(f"Unexpected error during install: {e}")
 
     if success:
-        print("\n✅ Java + Gradle installation attempted.")
-        print("Restart your terminal or export JAVA_HOME if needed.")
-
-        # In AUTO_INSTALL / -y / --build-apk mode, always do the SDK too (aggressive one-shot)
+        _set_java_home()
+        print("✅ Java + Gradle installation attempted.")
         if AUTO_INSTALL:
-            print("AUTO_INSTALL: also setting up Android SDK automatically...")
             setup_minimal_android_sdk()
-        else:
-            try:
-                sdk_resp = input("Also download Android command line tools + basic SDK? (~1GB, takes time) [Y/n]: ").strip().lower()
-                if sdk_resp not in ("n", "no"):
-                    setup_minimal_android_sdk()
-            except (EOFError, KeyboardInterrupt):
-                pass
     else:
-        print("\nCould not auto-install. Please install Java (JDK 17+) and Gradle manually.")
+        print("Could not auto-install. Please install Java (JDK 17+) and Gradle manually.")
 
 
 def download_gradle_manually() -> bool:
@@ -446,8 +420,8 @@ def setup_minimal_android_sdk() -> None:
         print(f"Then set ANDROID_HOME={sdk_root}")
 
 
-# Early detection so Pillow (and later build tools) can auto-install with no prompts
-# when -y / --yes / --auto / --build-apk or env var is present.
+# Early detection so Pillow and Android SDK can auto-install with no prompts.
+# Java/Gradle always install via pkg/apt when missing; -y also pulls the full SDK.
 AUTO_INSTALL = (
     bool(os.environ.get("LAUNCHER_ICONS_YES"))
     or bool(os.environ.get("LAUNCHER_ICONS_AUTO"))
@@ -785,9 +759,14 @@ if ! command -v gradle >/dev/null 2>&1 || ! command -v java >/dev/null 2>&1; the
         pkg update -y || true
         pkg install -y openjdk-17 gradle unzip wget coreutils || true
     elif command -v apt-get >/dev/null 2>&1; then
-        echo "apt detected: installing JDK + gradle (sudo may be needed)..."
-        sudo apt-get update -y || true
-        sudo apt-get install -y default-jdk gradle unzip wget || true
+        echo "apt detected: installing JDK + gradle..."
+        if [ "$(id -u)" -eq 0 ]; then
+            apt-get update -y || true
+            apt-get install -y default-jdk gradle unzip wget || true
+        else
+            sudo apt-get update -y || true
+            sudo apt-get install -y default-jdk gradle unzip wget || true
+        fi
     fi
 fi
 
@@ -821,7 +800,7 @@ if [ -f gradlew ]; then
     fi
 else
     echo "Still no gradlew."
-    echo "Run the original launcher_icons.py with --build-apk for full auto setup."
+    echo "Re-run launcher_icons.py on your icons folder (APK build is on by default)."
 fi
 '''
     build_sh_path = project_dir / "build.sh"
@@ -835,11 +814,11 @@ Generated {datetime.now().strftime("%Y-%m-%d %H:%M")} using launcher_icons.py
 
 This is a **complete, buildable Android project** (Gradle + Java).
 
-## Fastest one-shot CLI build (no GUI, no prompts)
+## Fastest one-shot CLI build (no GUI — APK is on by default)
 
 ```bash
 # From the icons folder
-python /path/to/launcher_icons.py . --create-icon-pack --build-apk -y --icon-pack-name {pack_name} --package-name {package_name}
+python /path/to/launcher_icons.py . -y --icon-pack-name {pack_name} --package-name {package_name}
 ```
 
 Or after generation:
@@ -852,17 +831,19 @@ The final APK will be placed next to this folder as `{pack_name}-release.apk`.
 
 ## Requirements & auto-setup
 
-The easiest way is to run the original `launcher_icons.py` with `--build-apk -y`.
-It will **fully automatically** install (no prompts):
+Running `launcher_icons.py` on an icons folder **by default**:
+- styles icons
+- creates this Gradle project
+- builds the APK
+
+It auto-installs via pkg/apt when needed:
 - Pillow (if missing)
 - openjdk + gradle
-- Android command line tools + required SDK components
 
-Use `-y` (or `--yes` / `--auto`) for true one-shot / CI behavior.
+Add `-y` for zero-prompt Android SDK setup too:
 
 ```bash
-# One command to rule them all
-./launcher_icons.py /path/to/icons --create-icon-pack --build-apk -y ...
+./launcher_icons.py /path/to/icons -y ...
 ```
 
 ## Updating icon mappings
@@ -886,11 +867,11 @@ gradle wrapper
 
 APK location: `app/build/outputs/apk/release/`
 
-**Pro tip:** Always prefer the original command:
+**Pro tip:** Just point the script at your icons folder — icon pack + APK are on by default:
 ```bash
-launcher_icons.py ... --create-icon-pack --build-apk -y
+launcher_icons.py /path/to/icons -y
 ```
-This is now the default one-shot behavior and will auto-install everything with no prompting.
+Use `--no-apk` or `--no-icon-pack` only if you want to skip those steps.
 
 ## Notes
 
@@ -913,25 +894,33 @@ Enjoy your custom icons!
 # ==================== MAIN ====================
 def main():
     parser = argparse.ArgumentParser(
-        description="Create launcher-style icons (icon + label below) and optionally generate an Android icon pack project."
+        description="Create launcher-style icons (icon + label below), generate an Android icon pack, and build an APK (all on by default)."
     )
     parser.add_argument("directory", help="Folder containing PNG icons")
     parser.add_argument("--dry-run", action="store_true", help="Preview changes without writing files")
     parser.add_argument("--max-label-chars", type=int, default=14, help="Max characters before ellipsis (default: 14)")
     parser.add_argument("--label-area-ratio", type=float, default=1/3, help="Extra height ratio for label area")
     parser.add_argument("--output-dir", default="processed_icons", help="Output subdirectory name")
-    parser.add_argument("--create-icon-pack", action="store_true", help="Also create a ready-to-build icon pack project")
-    parser.add_argument("--build-apk", action="store_true", help="Create the icon pack project AND attempt to build a release APK via Gradle (pure CLI, no GUI)")
+    parser.add_argument("--no-icon-pack", action="store_true",
+                        help="Only style icons; skip icon pack project generation")
+    parser.add_argument("--no-apk", action="store_true",
+                        help="Create icon pack project but skip APK build")
+    parser.add_argument("--create-icon-pack", action="store_true",
+                        help=argparse.SUPPRESS)  # legacy; icon pack is now default
+    parser.add_argument("--build-apk", action="store_true",
+                        help=argparse.SUPPRESS)  # legacy; APK build is now default
     parser.add_argument("-y", "--yes", "--auto", dest="auto_install", action="store_true",
-                        help="Auto-install EVERYTHING (Pillow + Java + Gradle + full Android SDK) with ZERO prompts. "
-                             "This + --build-apk is the recommended one-shot mode.")
+                        help="Also auto-install full Android SDK with ZERO prompts (Java/Gradle already install via pkg/apt by default)")
     parser.add_argument("--icon-pack-name", default="CustomIcons", help="Name of the icon pack folder/app")
     parser.add_argument("--package-name", default="com.yourname.customicons", help="Android package name")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
 
-    if (args.build_apk or args.auto_install) and not args.dry_run:
+    create_icon_pack = not args.no_icon_pack
+    build_apk = create_icon_pack and not args.no_apk
+
+    if build_apk and not args.dry_run:
         ensure_build_tools()
 
     target = Path(args.directory).expanduser().resolve()
@@ -975,8 +964,8 @@ def main():
 
     print(f"Summary: Total={total} | Processed={processed} | Skipped={skipped}")
 
-    if (args.create_icon_pack or args.build_apk) and not args.dry_run:
-        create_icon_pack_project(output_dir, args.icon_pack_name, args.package_name, args.build_apk)
+    if create_icon_pack and not args.dry_run:
+        create_icon_pack_project(output_dir, args.icon_pack_name, args.package_name, build_apk)
 
 
 if __name__ == "__main__":
